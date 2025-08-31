@@ -1,2 +1,429 @@
 Kode GEE untuk membuat dataset
 https://code.earthengine.google.com/1178fb7d1216e612ac83194045180278
+
+Berikut adalah script kode yang digunakan pada GEE:
+
+// ================== 1. DEFINISI REGION OF INTEREST (ROI) ==================
+Map.centerObject(ROI, 10);
+
+// Reset semua layer 
+Map.layers().reset();
+Map.addLayer(ROI, {color: 'red', fillColor: 'red'}, 'ROI Boundary', false);
+
+// ================== 2. FUNGSI UTAMA ==================
+
+// Fungsi untuk cloud masking
+function maskS2clouds(image) {
+  var bandNames = image.bandNames();
+  
+  if (bandNames.contains('MSK_CLDPRB')) {
+    var cloudProb = image.select('MSK_CLDPRB');
+    return image.updateMask(cloudProb.lt(20)).divide(10000);
+  }
+  else if (bandNames.contains('QA60')) {
+    var qa = image.select('QA60');
+    var cloudBitMask = 1 << 10;
+    var cirrusBitMask = 1 << 11;
+    var mask = qa.bitwiseAnd(cloudBitMask).eq(0)
+        .and(qa.bitwiseAnd(cirrusBitMask).eq(0));
+    return image.updateMask(mask).divide(10000);
+  }
+  else {
+    return image.divide(10000);
+  }
+}
+
+// Fungsi untuk menambah spectral indices
+var addIndices = function(image) {
+  // NDVI
+  var ndvi = image.normalizedDifference(['B8', 'B4']).rename('NDVI');
+  
+  // NDWI
+  var ndwi = image.normalizedDifference(['B3', 'B8']).rename('NDWI');
+  
+  // BSI
+  var bsi = image.expression(
+    '((RED + SWIR) - (NIR + BLUE)) / ((RED + SWIR) + (NIR + BLUE))', 
+    {
+      'RED': image.select('B4'), 
+      'BLUE': image.select('B2'),
+      'NIR': image.select('B8'),
+      'SWIR': image.select('B11')
+    }
+  ).rename('BSI');
+  
+  return image.addBands([ndvi, ndwi, bsi]);
+};
+
+// ================== 3. PEMROSESAN CITRA ==================
+
+// Variabel global untuk dataset dan komposit
+var dataset, composite, ndvi_std, ndwi_std, bsi_std;
+var datasetV1, datasetV2, datasetV3;
+
+// Daftar tahun yang tersedia
+var availableYears = ['2019', '2020', '2021', '2022', '2023', '2024'];
+
+// Fungsi untuk memproses data berdasarkan tahun yang dipilih
+function processDataForYear(selectedYear) {
+  // Filter tanggal untuk tahun yang dipilih
+  var startDate = selectedYear + '-01-01';
+  var endDate = selectedYear + '-12-31';
+  var period_of_interest = ee.Filter.date(startDate, endDate);
+
+  // Load dan proses dataset
+  dataset = ee.ImageCollection('COPERNICUS/S2_SR_HARMONIZED')
+    .filter(period_of_interest)
+    .filterBounds(ROI)
+    .filter(ee.Filter.lt('CLOUDY_PIXEL_PERCENTAGE', 10))
+    .map(maskS2clouds)
+    .map(addIndices);
+
+  print('Jumlah Citra dalam ROI untuk tahun ' + selectedYear + ':', dataset.size());
+
+  // Hitung statistik 
+  ndvi_std = dataset.select('NDVI').reduce(ee.Reducer.stdDev()).clip(ROI).rename('NDVI_STD');
+  ndwi_std = dataset.select('NDWI').reduce(ee.Reducer.stdDev()).clip(ROI).rename('NDWI_STD');
+  bsi_std = dataset.select('BSI').reduce(ee.Reducer.stdDev()).clip(ROI).rename('BSI_STD');
+
+  // Buat composite median 
+  composite = dataset.median().clip(ROI);
+
+  // Definisi 3 versi dataset
+  // V1: Semua band asli + metadata 
+  datasetV1 = composite.select([
+    'B1', 'B2', 'B3', 'B4', 'B5', 'B6', 'B7', 'B8', 'B8A', 'B9', 'B11', 'B12',
+    'AOT', 'WVP', 'SCL', 'TCI_R', 'TCI_G', 'TCI_B',
+    'MSK_CLDPRB', 'MSK_SNWPRB'
+  ]).clip(ROI);
+
+  // V2: Band multispectral utama 
+  datasetV2 = composite.select([
+    'B2', 'B3', 'B4', 'B5', 'B6', 'B7', 'B8', 'B11', 'B12'
+  ]).clip(ROI);
+
+  // V3: Band utama + statistik indices 
+  datasetV3 = composite.select(['B2', 'B3', 'B4', 'B5', 'B6', 'B7', 'B8', 'B11', 'B12'])
+    .addBands(ndvi_std)
+    .addBands(ndwi_std)
+    .addBands(bsi_std)
+    .clip(ROI);
+
+  print('Dataset untuk tahun ' + selectedYear + ':');
+  print('V1 Bands:', datasetV1.bandNames());
+  print('V2 Bands:', datasetV2.bandNames());
+  print('V3 Bands:', datasetV3.bandNames());
+  
+  // Update info label
+  infoLabel.setValue('Skala: 10 meter | Tahun: ' + selectedYear);
+}
+
+// ================== 4. LEGENDA  ==================
+
+var legend = ui.Panel({
+  style: {
+    position: 'bottom-left', 
+    padding: '8px',
+    backgroundColor: 'white',
+    border: '1px solid #ccc'
+  }
+});
+
+var legendTitle = ui.Label({
+  value: 'LEGENDA TUTUPAN LAHAN',
+  style: {fontWeight: 'bold', fontSize: '12px', margin: '0 0 8px 0'}
+});
+legend.add(legendTitle);
+
+// Classes 
+var classes = [
+  {color: '#FFFF00', label: 'Sawah'},
+  {color: '#00FFFF', label: 'Kolam/Tambak'},
+  {color: '#FF0000', label: 'Pemukiman'},
+  {color: '#00FF00', label: 'Kebun Campuran'},
+  {color: '#0000FF', label: 'Badan Air'},
+  {color: '#006400', label: 'Hutan'}
+];
+
+classes.forEach(function(cls) {
+  var colorBox = ui.Label({
+    style: {
+      backgroundColor: cls.color, 
+      padding: '8px', 
+      margin: '0 5px 0 0',
+      border: '1px solid #000'
+    }
+  });
+  
+  var label = ui.Label({
+    value: cls.label,
+    style: {fontSize: '11px'}
+  });
+  
+  var item = ui.Panel({
+    widgets: [colorBox, label],
+    layout: ui.Panel.Layout.Flow('horizontal')
+  });
+  
+  legend.add(item);
+});
+
+Map.add(legend);
+
+// ================== 5. VISUALISASI ==================
+
+// Panel kontrol 
+var panel = ui.Panel({
+  style: {
+    position: 'top-right', 
+    padding: '10px',
+    backgroundColor: 'white',
+    border: '1px solid #ccc'
+  }
+});
+
+var title = ui.Label({
+  value: 'KONTROL VISUALISASI ROI',
+  style: {fontWeight: 'bold', fontSize: '14px', margin: '0 0 10px 0'}
+});
+panel.add(title);
+
+// Dropdown untuk memilih tahun
+var yearSelect = ui.Select({
+  items: availableYears,
+  value: '2023',
+  onChange: function(selectedYear) {
+    // Proses data untuk tahun yang dipilih
+    processDataForYear(selectedYear);
+    
+    // Refresh visualisasi dengan dataset yang aktif
+    var selectedDataset = datasetSelect.getValue();
+    visualizeROI(selectedDataset);
+    
+    // Hitung statistik baru
+    calculateROIStats();
+  }
+});
+panel.add(ui.Label('Pilih Tahun:'));
+panel.add(yearSelect);
+
+// Dropdown untuk memilih dataset
+var datasetSelect = ui.Select({
+  items: [
+    {label: 'V1 - Semua Fitur', value: 'V1'},
+    {label: 'V2 - Band Utama', value: 'V2'},
+    {label: 'V3 - Band + Statistik', value: 'V3'}
+  ],
+  value: 'V2',
+  onChange: function(selected) {
+    Map.layers().reset();
+    Map.addLayer(ROI, {color: 'red'}, 'Batas ROI', false);
+    visualizeROI(selected);
+  }
+});
+panel.add(ui.Label('Pilih Dataset:'));
+panel.add(datasetSelect);
+
+// Fungsi visualisasi 
+function visualizeROI(version) {
+  var dataset;
+  
+  switch(version) {
+    case 'V1':
+      dataset = datasetV1;
+      Map.addLayer(dataset, 
+        {bands: ['B4', 'B3', 'B2'], min: 0, max: 0.3, gamma: 1.3}, 
+        'V1 - Natural Color (ROI)');
+      Map.addLayer(dataset, 
+        {bands: ['B8', 'B4', 'B3'], min: 0, max: 0.3, gamma: 1.3}, 
+        'V1 - False Color (ROI)');
+      break;
+      
+    case 'V2':
+      dataset = datasetV2;
+      Map.addLayer(dataset, 
+        {bands: ['B4', 'B3', 'B2'], min: 0, max: 0.3, gamma: 1.3}, 
+        'V2 - Natural Color (ROI)', true);
+      Map.addLayer(dataset, 
+        {bands: ['B8', 'B4', 'B3'], min: 0, max: 0.3, gamma: 1.3}, 
+        'V2 - False Color (ROI)', false);
+      Map.addLayer(dataset, 
+        {bands: ['B11', 'B8', 'B4'], min: 0, max: 0.3, gamma: 1.3}, 
+        'V2 - SWIR Composite (ROI)', false);
+      break;
+      
+    case 'V3':
+      dataset = datasetV3;
+      Map.addLayer(dataset, 
+        {bands: ['B4', 'B3', 'B2'], min: 0, max: 0.3, gamma: 1.3}, 
+        'V3 - Natural Color (ROI)', true);
+      
+      // Visualisasi indices statistics untuk ROI
+      Map.addLayer(dataset.select('NDVI_STD'), 
+        {min: 0, max: 0.15, palette: ['blue', 'green', 'yellow', 'red']}, 
+        'V3 - NDVI StdDev (ROI)', false);
+      
+      Map.addLayer(dataset.select('NDWI_STD'), 
+        {min: 0, max: 0.1, palette: ['purple', 'blue', 'cyan', 'green']}, 
+        'V3 - NDWI StdDev (ROI)', false);
+      
+      Map.addLayer(dataset.select('BSI_STD'), 
+        {min: 0, max: 0.08, palette: ['green', 'yellow', 'orange', 'brown']}, 
+        'V3 - BSI StdDev (ROI)', false);
+      break;
+  }
+  
+  // Zoom ke ROI
+  Map.centerObject(ROI, 10);
+}
+
+// ================== 6. INFORMASI STATISTIK ==================
+
+// Hitung statistik
+function calculateROIStats() {
+  var statsV2 = datasetV2.reduceRegion({
+    reducer: ee.Reducer.mean(),
+    geometry: ROI,
+    scale: 10,
+    maxPixels: 1e9
+  });
+  
+  print('Rata-rata Nilai Band dalam ROI (V2) untuk tahun ' + yearSelect.getValue() + ':', statsV2);
+}
+
+// ================== 7. EKSPOR ==================
+
+// Fungsi ekspor untuk semua versi dataset
+function exportAllDatasets() {
+  var year = yearSelect.getValue();
+  
+  // Ekspor V1 - Semua Fitur
+  Export.image.toDrive({
+    image: datasetV1,
+    description: 'ROI_DATASET_V1_SEMUA_FITUR_' + year,
+    scale: 10,
+    region: ROI,
+    maxPixels: 1e13,
+    fileFormat: 'GeoTIFF',
+    folder: 'GEE_Exports'
+  });
+  
+  // Ekspor V2 - Band Utama
+  Export.image.toDrive({
+    image: datasetV2,
+    description: 'ROI_DATASET_V2_BAND_UTAMA_' + year,
+    scale: 10,
+    region: ROI,
+    maxPixels: 1e13,
+    fileFormat: 'GeoTIFF',
+    folder: 'GEE_Exports'
+  });
+  
+  // Ekspor V3 - Band + Statistik
+  Export.image.toDrive({
+    image: datasetV3,
+    description: 'ROI_DATASET_V3_BAND_STATISTIK_' + year,
+    scale: 10,
+    region: ROI,
+    maxPixels: 1e13,
+    fileFormat: 'GeoTIFF',
+    folder: 'GEE_Exports'
+  });
+  
+  print('Semua dataset untuk tahun ' + year + ' sedang diekspor:');
+  print('- V1: Semua Fitur (20 bands)');
+  print('- V2: Band Utama (9 bands)');
+  print('- V3: Band + Statistik (12 bands)');
+}
+
+// Tombol ekspor semua dataset
+var exportAllButton = ui.Button({
+  label: 'Ekspor Semua Dataset',
+  onClick: exportAllDatasets,
+  style: {margin: '5px 0', backgroundColor: '#4CAF50'}
+});
+panel.add(exportAllButton);
+
+// Fungsi ekspor per versi
+function exportSelectedDataset() {
+  var selected = datasetSelect.getValue();
+  var year = yearSelect.getValue();
+  
+  switch(selected) {
+    case 'V1':
+      Export.image.toDrive({
+        image: datasetV1,
+        description: 'ROI_DATASET_V1_SEMUA_FITUR_' + year,
+        scale: 10,
+        region: ROI,
+        maxPixels: 1e13,
+        fileFormat: 'GeoTIFF'
+      });
+      print('Dataset V1 (Semua Fitur) untuk tahun ' + year + ' sedang diekspor...');
+      break;
+      
+    case 'V2':
+      Export.image.toDrive({
+        image: datasetV2,
+        description: 'ROI_DATASET_V2_BAND_UTAMA_' + year,
+        scale: 10,
+        region: ROI,
+        maxPixels: 1e13,
+        fileFormat: 'GeoTIFF'
+      });
+      print('Dataset V2 (Band Utama) untuk tahun ' + year + ' sedang diekspor...');
+      break;
+      
+    case 'V3':
+      Export.image.toDrive({
+        image: datasetV3,
+        description: 'ROI_DATASET_V3_BAND_STATISTIK_' + year,
+        scale: 10,
+        region: ROI,
+        maxPixels: 1e13,
+        fileFormat: 'GeoTIFF'
+      });
+      print('Dataset V3 (Band + Statistik) untuk tahun ' + year + ' sedang diekspor...');
+      break;
+  }
+}
+
+// Tombol ekspor dataset terpilih
+var exportSelectedButton = ui.Button({
+  label: 'Ekspor Dataset Terpilih',
+  onClick: exportSelectedDataset,
+  style: {margin: '5px 0', backgroundColor: '#2196F3'}
+});
+panel.add(exportSelectedButton);
+
+// ================== 8. INFORMASI TAMBAHAN ==================
+
+// Tambahkan informasi tambahan di legenda
+var infoLabel = ui.Label({
+  value: 'Skala: 10 meter | Tahun: 2023',
+  style: {fontSize: '10px', color: '#666', margin: '8px 0 0 0'}
+});
+legend.add(infoLabel);
+
+// ================== 9. INISIALISASI DAN TAMPILKAN ==================
+
+// Proses data untuk tahun default (2023)
+processDataForYear('2023');
+
+// Tampilkan visualisasi awal
+visualizeROI('V2');
+Map.add(panel);
+
+// Hitung statistik awal
+calculateROIStats();
+
+// Informasi dataset di console
+print('=== INFORMASI DATASET ===');
+print('V1 - Semua Fitur: 20 bands (semua band asli + metadata)');
+print('V2 - Band Utama: 9 bands (B2, B3, B4, B5, B6, B7, B8, B11, B12)');
+print('V3 - Band + Statistik: 12 bands (V2 + NDVI_STD, NDWI_STD, BSI_STD)');
+print('Tersedia tahun: 2019-2024');
+print('');
+print('=== PETUNJUK EKSPOR ===');
+print('• "Ekspor Semua Dataset": Download semua versi untuk tahun terpilih');
+print('• "Ekspor Dataset Terpilih": Download versi yang aktif untuk tahun terpilih');
